@@ -1,0 +1,15 @@
+# Generated database (rebuilt by build_database.py, or by the app on first run)
+exoplanets.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local tooling and secrets
+.claude/
+.streamlit/secrets.toml
+
+# Private design and planning docs
+ignore/
