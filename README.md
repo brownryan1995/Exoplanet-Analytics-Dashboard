@@ -6,7 +6,7 @@ resolves them to one trustworthy row per planet (~6,400 planets), and a Streamli
 the result: headline KPIs, discoveries over time, self-service filtering, and a drill-down to
 every source measurement behind each planet.
 
-**Live demo:** _add the Streamlit Community Cloud link here once deployed_
+**Live demo:** https://exoplanet-analytics-dashboard.streamlit.app/
 
 ![Dashboard screenshot](docs/screenshot.png)
 
@@ -15,14 +15,16 @@ every source measurement behind each planet.
 
 ## Features
 
+- **Global filters:** name, discovery method, year range, radius, distance, controversial flag,
+  and solution type. They apply instantly to every view at once, and all views share one SQL
+  `WHERE` clause.
 - **Overview KPIs:** confirmed planets, host stars, discovery methods, latest discovery year,
   and planets discovered that year.
-- **Discoveries over time:** stacked bar chart of planets per year by discovery method, with a
-  method filter, hover breakdowns, and the underlying data table.
-- **Explore planets:** a filterable table (name, method, year, radius, distance, controversial
-  flag, solution type) with CSV download. Selecting a planet opens a detail view with its
-  curated values, the study they came from, and every competing parameter set ranked by the
-  selection rule.
+- **Discoveries over time:** stacked bar chart of planets per year by discovery method, with
+  hover breakdowns and the underlying data table.
+- **Explore planets:** the filtered table with CSV download. Selecting a planet opens a detail
+  view with its curated values, the study they came from, and every competing parameter set
+  ranked by the selection rule.
 - **Notes & methods:** the data source, the selection rule in plain language, and known caveats.
 - **Visible SQL:** every view has a "SQL behind this" expander showing the exact query it ran.
 

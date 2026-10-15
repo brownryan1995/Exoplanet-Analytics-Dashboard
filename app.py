@@ -225,6 +225,125 @@ def available(columns) -> list[str]:
     return [c for c in columns if c in PLANET_COLUMNS]
 
 
+# --- Reference values (always over the full dataset) ----------------------------
+
+TOTAL_PLANETS = int(query("SELECT COUNT(*) FROM planets").iloc[0, 0])
+METHOD_COUNTS = query(
+    "SELECT discoverymethod, COUNT(*) AS planets FROM planets "
+    "GROUP BY discoverymethod ORDER BY planets DESC, discoverymethod"
+)
+ALL_METHODS = METHOD_COUNTS.discoverymethod.tolist()
+METHOD_N = METHOD_COUNTS.set_index("discoverymethod").planets
+# Color follows the method, ranked on the full dataset, so filtering never repaints a series.
+TOP_METHODS = ALL_METHODS[: len(SERIES_COLORS["light"])]
+YEAR_MIN, YEAR_MAX = (int(v) for v in query("SELECT MIN(disc_year), MAX(disc_year) FROM planets").iloc[0])
+SOLTYPE_COUNTS = query(
+    "SELECT soltype, COUNT(*) AS planets FROM planets WHERE soltype IS NOT NULL "
+    "GROUP BY soltype ORDER BY planets DESC"
+).set_index("soltype").planets
+UNKNOWN_COUNTS = query(
+    "SELECT SUM(pl_rade IS NULL) AS radius, SUM(sy_dist IS NULL) AS distance FROM planets"
+).iloc[0]
+
+
+# --- Filters (sidebar) -----------------------------------------------------------
+# One set of filters drives every view: the KPI tiles, the chart and the table.
+
+def stop_label(value: float) -> str:
+    return "no limit" if value == INF else f"{value:g}"
+
+
+# Clearing a widget's session-state value does not redraw the widget, so a reset
+# would leave stale values on screen. Instead every filter key carries a version
+# number, and a reset bumps it so Streamlit draws fresh widgets at their defaults.
+st.session_state.setdefault("filters_version", 0)
+
+
+def fkey(name: str) -> str:
+    return f"f_{name}_{st.session_state.filters_version}"
+
+
+def reset_filters() -> None:
+    st.session_state.filters_version += 1
+
+
+with st.sidebar:
+    st.header("Filters")
+    st.caption("Filters apply instantly to the whole dashboard: tiles, chart and table.")
+    search = st.text_input("Planet or host name contains", key=fkey("search"),
+                           placeholder="e.g. TRAPPIST, then press Enter").strip()
+    methods = st.multiselect("Discovery method", ALL_METHODS, key=fkey("methods"), placeholder="All methods",
+                             format_func=lambda m: f"{m} ({METHOD_N[m]:,})")
+    years = st.slider("Discovery year", YEAR_MIN, YEAR_MAX, (YEAR_MIN, YEAR_MAX), key=fkey("years"))
+    radius = st.select_slider("Planet radius (Earth radii)", RADIUS_STOPS, (0, INF),
+                              format_func=stop_label, key=fkey("radius"))
+    keep_no_radius = st.checkbox(
+        "Keep planets with no radius value", key=fkey("keep_no_radius"), disabled=radius == (0, INF),
+        help=f"Applies once the range is narrowed. {UNKNOWN_COUNTS.radius:,} planets have no radius "
+             "in their selected parameter set (common for radial-velocity discoveries).",
+    )
+    distance = st.select_slider("Distance from Earth (parsecs)", DISTANCE_STOPS, (0, INF),
+                                format_func=stop_label, key=fkey("distance"))
+    keep_no_distance = st.checkbox(
+        "Keep planets with no distance value", key=fkey("keep_no_distance"), disabled=distance == (0, INF),
+        help=f"Applies once the range is narrowed. {UNKNOWN_COUNTS.distance:,} planets have no distance.",
+    )
+    st.subheader("Quality signals")
+    exclude_controversial = st.toggle(
+        "Exclude controversial planets", key=fkey("no_controversial"),
+        help="Planets whose status is flagged as questioned in the literature (pl_controv_flag = 1).",
+    )
+    soltypes = st.multiselect(
+        "Solution type of the selected parameter set", SOLTYPE_COUNTS.index.tolist(), key=fkey("soltypes"),
+        placeholder="All solution types", format_func=lambda s: f"{s} ({SOLTYPE_COUNTS[s]:,})",
+        help="Every planet here is confirmed; this describes the study row chosen for it, e.g. a "
+             "published paper vs. a Kepler/TESS pipeline catalog.",
+    )
+    st.button("Reset filters", on_click=reset_filters, width="stretch")
+
+
+def range_clause(col: str, bounds: tuple[float, float], keep_unknown: bool):
+    lo, hi = bounds
+    conds, params = [], []
+    if lo > 0:
+        conds.append(f"{col} >= ?")
+        params.append(float(lo))
+    if hi != INF:
+        conds.append(f"{col} <= ?")
+        params.append(float(hi))
+    if not conds:
+        return None, []
+    clause = " AND ".join(conds)
+    if keep_unknown:
+        clause = f"(({clause}) OR {col} IS NULL)"
+    return clause, params
+
+
+where, params = [], []
+if search:
+    where.append("(pl_name LIKE ? OR hostname LIKE ?)")
+    params += [f"%{search}%"] * 2
+if methods:
+    where.append(f"discoverymethod IN ({', '.join('?' * len(methods))})")
+    params += methods
+if years != (YEAR_MIN, YEAR_MAX):
+    where.append("disc_year BETWEEN ? AND ?")
+    params += list(years)
+for col, bounds, keep in [("pl_rade", radius, keep_no_radius), ("sy_dist", distance, keep_no_distance)]:
+    clause, clause_params = range_clause(col, bounds, keep)
+    if clause:
+        where.append(clause)
+        params += clause_params
+if exclude_controversial:
+    where.append("COALESCE(pl_controv_flag, 0) = 0")
+if soltypes:
+    where.append(f"soltype IN ({', '.join('?' * len(soltypes))})")
+    params += soltypes
+
+# Shared WHERE clause, spliced into every view's query below.
+FILTER_SQL = ("WHERE " + "\n  AND ".join(where) + "\n") if where else ""
+
+
 # --- Header & KPIs --------------------------------------------------------------
 
 st.title("🪐 Exoplanet Analytics Dashboard")
@@ -234,39 +353,49 @@ st.caption(
     "Personal portfolio project; no employer data."
 )
 
-KPI_SQL = """
+KPI_SQL = f"""
+WITH filtered AS (
+    SELECT * FROM planets
+    {FILTER_SQL.replace(chr(10), chr(10) + "    ").rstrip()}
+)
 SELECT COUNT(*)                        AS planets,
        COUNT(DISTINCT hostname)        AS host_stars,
        COUNT(DISTINCT discoverymethod) AS methods,
        MAX(disc_year)                  AS latest_year,
-       SUM(disc_year = (SELECT MAX(disc_year) FROM planets)) AS latest_year_planets
-FROM planets
+       SUM(disc_year = (SELECT MAX(disc_year) FROM filtered)) AS latest_year_planets
+FROM filtered
 """
-kpi = query(KPI_SQL).iloc[0]
+kpi = query(KPI_SQL, params).iloc[0]
+n_match = int(kpi.planets)
+
+if where:
+    note, clear = st.columns([5, 1], vertical_alignment="center")
+    note.info(f"**Filters active:** every view shows **{n_match:,}** of {TOTAL_PLANETS:,} planets.",
+              icon="🔎")
+    clear.button("Clear filters", on_click=reset_filters, width="stretch", key="clear_filters_top")
+
+
+def count(value) -> str:
+    return "—" if value is None or pd.isna(value) else f"{int(value):,}"
+
+
+latest = "—" if pd.isna(kpi.latest_year) else str(int(kpi.latest_year))
 tiles = st.columns(5)
-tiles[0].metric("Confirmed planets", f"{kpi.planets:,}", border=True)
-tiles[1].metric("Host stars", f"{kpi.host_stars:,}", border=True)
-tiles[2].metric("Discovery methods", f"{kpi.methods}", border=True)
-tiles[3].metric("Latest discovery year", f"{kpi.latest_year}", border=True)
+tiles[0].metric("Confirmed planets", count(kpi.planets), border=True)
+tiles[1].metric("Host stars", count(kpi.host_stars), border=True)
+tiles[2].metric("Discovery methods", count(kpi.methods), border=True)
+tiles[3].metric("Latest discovery year", latest, border=True)
 tiles[4].metric(
-    f"Discovered in {kpi.latest_year}", f"{kpi.latest_year_planets:,}", border=True,
-    help=f"Year to date as of the archive export ({EXPORTED_AT}).",
+    f"Discovered in {latest}", count(kpi.latest_year_planets), border=True,
+    help=(f"{YEAR_MAX} is year to date as of the archive export ({EXPORTED_AT})."
+          if latest == str(YEAR_MAX) else None),
 )
 with st.expander("SQL behind these numbers"):
-    show_sql(KPI_SQL)
+    show_sql(KPI_SQL, params)
 
 tab_time, tab_explore, tab_notes = st.tabs(["Discoveries over time", "Explore planets", "Notes & methods"])
 
 # --- Discoveries over time -----------------------------------------------------
-
-METHOD_COUNTS = query(
-    "SELECT discoverymethod, COUNT(*) AS planets FROM planets "
-    "GROUP BY discoverymethod ORDER BY planets DESC, discoverymethod"
-)
-ALL_METHODS = METHOD_COUNTS.discoverymethod.tolist()
-METHOD_N = METHOD_COUNTS.set_index("discoverymethod").planets
-# Color follows the method, ranked on the full dataset, so filtering never repaints a series.
-TOP_METHODS = ALL_METHODS[: len(SERIES_COLORS["light"])]
 
 
 def series_for(method: str) -> str:
@@ -320,28 +449,23 @@ def discoveries_chart(counts: pd.DataFrame) -> go.Figure:
 
 with tab_time:
     st.subheader("Planets discovered per year, by discovery method")
-    picked_methods = st.multiselect(
-        "Discovery methods", ALL_METHODS, default=ALL_METHODS,
-        format_func=lambda m: f"{m} ({METHOD_N[m]:,})",
-    )
-    if not picked_methods:
-        st.info("Select at least one discovery method to draw the chart.")
-    else:
-        placeholders = ", ".join("?" * len(picked_methods))
-        trend_sql = f"""
+    trend_sql = f"""
 SELECT disc_year, discoverymethod, COUNT(*) AS planets
 FROM planets
-WHERE discoverymethod IN ({placeholders})
-GROUP BY disc_year, discoverymethod
+{FILTER_SQL}GROUP BY disc_year, discoverymethod
 ORDER BY disc_year, discoverymethod
 """
-        trend = query(trend_sql, picked_methods)
+    trend = query(trend_sql, params)
+    if trend.empty:
+        st.info("No planets match the current filters. Loosen them in the sidebar to draw the chart.")
+    else:
         st.plotly_chart(discoveries_chart(trend), width="stretch", config={"displaylogo": False})
-        tail = [m for m in picked_methods if m not in TOP_METHODS]
+        tail = [m for m in ALL_METHODS if m not in TOP_METHODS and m in set(trend.discoverymethod)]
         if tail:
             st.caption(
                 f"*{OTHER_LABEL}* groups {len(tail)} rarer method(s) ({', '.join(tail)}) so the "
-                "chart stays readable; hover a bar for the breakdown."
+                "chart stays readable; hover a bar for the breakdown. Use the sidebar's *Discovery "
+                "method* filter to choose which methods are shown."
             )
         with st.expander("Chart data and SQL"):
             table = trend.pivot_table(index="disc_year", columns="discoverymethod", values="planets",
@@ -349,105 +473,12 @@ ORDER BY disc_year, discoverymethod
             table = table[[m for m in ALL_METHODS if m in table.columns]]
             table.insert(0, "Total", table.sum(axis=1))
             st.dataframe(table.rename_axis("Year").sort_index(ascending=False), width="stretch")
-            show_sql(trend_sql, picked_methods)
+            show_sql(trend_sql, params)
 
 # --- Explore -------------------------------------------------------------------
 
-YEAR_MIN, YEAR_MAX = (int(v) for v in query("SELECT MIN(disc_year), MAX(disc_year) FROM planets").iloc[0])
-SOLTYPE_COUNTS = query(
-    "SELECT soltype, COUNT(*) AS planets FROM planets WHERE soltype IS NOT NULL "
-    "GROUP BY soltype ORDER BY planets DESC"
-).set_index("soltype").planets
-UNKNOWN_COUNTS = query(
-    "SELECT SUM(pl_rade IS NULL) AS radius, SUM(sy_dist IS NULL) AS distance FROM planets"
-).iloc[0]
-
-
-def stop_label(value: float) -> str:
-    return "no limit" if value == INF else f"{value:g}"
-
-
-def reset_filters() -> None:
-    for key in [k for k in st.session_state if k.startswith("f_")]:
-        del st.session_state[key]
-
-
-with st.sidebar:
-    st.header("Explore filters")
-    st.caption("These filter the **Explore planets** tab. The KPIs and chart always cover every planet.")
-    search = st.text_input("Planet or host name contains", key="f_search").strip()
-    methods = st.multiselect("Discovery method", ALL_METHODS, key="f_methods", placeholder="All methods")
-    years = st.slider("Discovery year", YEAR_MIN, YEAR_MAX, (YEAR_MIN, YEAR_MAX), key="f_years")
-    radius = st.select_slider("Planet radius (Earth radii)", RADIUS_STOPS, (0, INF),
-                              format_func=stop_label, key="f_radius")
-    keep_no_radius = st.checkbox(
-        "Keep planets with no radius value", key="f_keep_no_radius", disabled=radius == (0, INF),
-        help=f"Applies once the range is narrowed. {UNKNOWN_COUNTS.radius:,} planets have no radius "
-             "in their selected parameter set (common for radial-velocity discoveries).",
-    )
-    distance = st.select_slider("Distance from Earth (parsecs)", DISTANCE_STOPS, (0, INF),
-                                format_func=stop_label, key="f_distance")
-    keep_no_distance = st.checkbox(
-        "Keep planets with no distance value", key="f_keep_no_distance", disabled=distance == (0, INF),
-        help=f"Applies once the range is narrowed. {UNKNOWN_COUNTS.distance:,} planets have no distance.",
-    )
-    st.subheader("Quality signals")
-    exclude_controversial = st.toggle(
-        "Exclude controversial planets", key="f_no_controversial",
-        help="Planets whose status is flagged as questioned in the literature (pl_controv_flag = 1).",
-    )
-    soltypes = st.multiselect(
-        "Solution type of the selected parameter set", SOLTYPE_COUNTS.index.tolist(), key="f_soltypes",
-        placeholder="All solution types", format_func=lambda s: f"{s} ({SOLTYPE_COUNTS[s]:,})",
-        help="Every planet here is confirmed; this describes the study row chosen for it, e.g. a "
-             "published paper vs. a Kepler/TESS pipeline catalog.",
-    )
-    st.button("Reset filters", on_click=reset_filters, width="stretch")
-
-
-def range_clause(col: str, bounds: tuple[float, float], keep_unknown: bool):
-    lo, hi = bounds
-    conds, params = [], []
-    if lo > 0:
-        conds.append(f"{col} >= ?")
-        params.append(float(lo))
-    if hi != INF:
-        conds.append(f"{col} <= ?")
-        params.append(float(hi))
-    if not conds:
-        return None, []
-    clause = " AND ".join(conds)
-    if keep_unknown:
-        clause = f"(({clause}) OR {col} IS NULL)"
-    return clause, params
-
-
-where, params = [], []
-if search:
-    where.append("(pl_name LIKE ? OR hostname LIKE ?)")
-    params += [f"%{search}%"] * 2
-if methods:
-    where.append(f"discoverymethod IN ({', '.join('?' * len(methods))})")
-    params += methods
-if years != (YEAR_MIN, YEAR_MAX):
-    where.append("disc_year BETWEEN ? AND ?")
-    params += list(years)
-for col, bounds, keep in [("pl_rade", radius, keep_no_radius), ("sy_dist", distance, keep_no_distance)]:
-    clause, clause_params = range_clause(col, bounds, keep)
-    if clause:
-        where.append(clause)
-        params += clause_params
-if exclude_controversial:
-    where.append("COALESCE(pl_controv_flag, 0) = 0")
-if soltypes:
-    where.append(f"soltype IN ({', '.join('?' * len(soltypes))})")
-    params += soltypes
-
 explore_cols = available(EXPLORE_COLUMNS)
-explore_sql = f"SELECT {', '.join(explore_cols)}\nFROM planets\n"
-if where:
-    explore_sql += "WHERE " + "\n  AND ".join(where) + "\n"
-explore_sql += "ORDER BY disc_year DESC, pl_name"
+explore_sql = f"SELECT {', '.join(explore_cols)}\nFROM planets\n{FILTER_SQL}ORDER BY disc_year DESC, pl_name"
 
 
 def on_table_select() -> None:
@@ -543,13 +574,13 @@ ORDER BY selection_rank
 
 
 with tab_explore:
-    total = int(kpi.planets)
+    total = TOTAL_PLANETS
     planets = query(explore_sql, params)
     planets["reference"] = ref_labels(planets.pop("pl_refname"))
     st.session_state["_explore_names"] = planets.pl_name.tolist()
 
     head_left, head_right = st.columns([3, 1], vertical_alignment="bottom")
-    head_left.markdown(f"**{len(planets):,}** of {total:,} planets match the sidebar filters. "
+    head_left.markdown(f"**{len(planets):,}** of {total:,} planets match the filters. "
                        "Select a row to see where its values come from.")
     head_right.download_button(
         "Download CSV", planets.to_csv(index=False).encode("utf-8"), "exoplanets_filtered.csv",
@@ -652,7 +683,7 @@ every competing parameter set ranked by this rule.
   upper limit.
 - **Error columns are kept but hidden.** Every `*err1`/`*err2` uncertainty column is stored in both
   tables; the views do not display them.
-- **The latest year is partial.** Discovery counts for {kpi.latest_year} run to the export date.
+- **The latest year is partial.** Discovery counts for {YEAR_MAX} run to the export date.
 - **Publication dates vary in precision** (`2011-08`, `2017-08-31`, `2017-08-31 00:00`); they are
   compared on their ISO prefix.
 - **Parsing note.** The CSV starts with `#` metadata lines, but some reference fields also contain
